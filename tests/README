@@ -1,0 +1,9 @@
+1) Unzip all files into new folder.
+2) chmod +x unit.sh
+3) ./unit.sh
+4) copy prf into this folder (only the executable file)
+5) ./unit.out
+	
+	Results will be printed. You are able to choose specific test by typing it number. i.e. ./unit.out 5
+
+

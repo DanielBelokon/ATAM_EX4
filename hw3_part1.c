@@ -29,7 +29,6 @@
  * 			- If -1: Symbol not found.
  *			- If -2: Only a local symbol was found.
  * 			- If -3: File is not an executable.
- * 			- If -4: The symbol was found, it is global, but it is not defined in the executable.
  * return value		- The address which the symbol_name will be loaded to, if the symbol was found and is global.
  */
 unsigned long find_symbol(const char *symbol_name, char *exe_file_name, int *error_val)
@@ -46,7 +45,6 @@ unsigned long find_symbol(const char *symbol_name, char *exe_file_name, int *err
 
 	if (ehdr.e_type != ET_EXEC)
 	{
-		printf("Not an executable! :( \n %d", ehdr.e_type);
 		*error_val = -3;
 		return 0;
 	}
@@ -80,7 +78,7 @@ unsigned long find_symbol(const char *symbol_name, char *exe_file_name, int *err
 		}
 	}
 
-	Elf64_Sym sym;
+	Elf64_Sym sym = {0};
 	char *strtab_buf = malloc(strtab.sh_size);
 	fseek(fptr, strtab.sh_offset, SEEK_SET);
 	fread(strtab_buf, strtab.sh_size, 1, fptr);
@@ -88,13 +86,18 @@ unsigned long find_symbol(const char *symbol_name, char *exe_file_name, int *err
 	Elf64_Sym symtab_buf[symtab.sh_size / sizeof(Elf64_Sym)];
 	fseek(fptr, symtab.sh_offset, SEEK_SET);
 	fread(symtab_buf, symtab.sh_size, 1, fptr);
+	bool found_global = false;
 
 	for (int i = 0; i < symtab.sh_size / sizeof(Elf64_Sym); i++)
 	{
 		if (strcmp(strtab_buf + symtab_buf[i].st_name, symbol_name) == 0)
 		{
 			sym = symtab_buf[i];
-			break;
+			if (ELF64_ST_BIND(symtab_buf[i].st_info) == STB_GLOBAL)
+			{
+				found_global = true;
+				break;
+			}
 		}
 	}
 
@@ -105,15 +108,79 @@ unsigned long find_symbol(const char *symbol_name, char *exe_file_name, int *err
 		return 0;
 	}
 
-	if (sym.st_shndx == SHN_UNDEF)
+	if (found_global && sym.st_shndx == SHN_UNDEF)
 	{
-		*error_val = -4;
-		return 0;
+		// find the symbol in the dynsym section
+		Elf64_Shdr dynsym;
+		for (int i = 0; i < ehdr.e_shnum; i++)
+		{
+			fseek(fptr, ehdr.e_shoff + i * sizeof(Elf64_Shdr), SEEK_SET);
+			fread(&shdr, sizeof(Elf64_Shdr), 1, fptr);
+
+			if (strcmp(shstrtab_buf + shdr.sh_name, ".dynsym") == 0)
+			{
+				dynsym = shdr;
+				break;
+			}
+		}
+
+		Elf64_Sym dynsym_buf[dynsym.sh_size / sizeof(Elf64_Sym)];
+		fseek(fptr, dynsym.sh_offset, SEEK_SET);
+		fread(dynsym_buf, dynsym.sh_size, 1, fptr);
+
+		for (int i = 0; i < dynsym.sh_size / sizeof(Elf64_Sym); i++)
+		{
+			if (strcmp(strtab_buf + dynsym_buf[i].st_name, symbol_name) == 0)
+			{
+				sym = dynsym_buf[i];
+				break;
+			}
+		}
+		// find the symbol in the rela.plt section
+		Elf64_Shdr rela_plt;
+		for (int i = 0; i < ehdr.e_shnum; i++)
+		{
+			fseek(fptr, ehdr.e_shoff + i * sizeof(Elf64_Shdr), SEEK_SET);
+			fread(&shdr, sizeof(Elf64_Shdr), 1, fptr);
+
+			if (strcmp(shstrtab_buf + shdr.sh_name, ".rela.plt") == 0)
+			{
+				rela_plt = shdr;
+				break;
+			}
+		}
+
+		Elf64_Rela rela_plt_buf[rela_plt.sh_size / sizeof(Elf64_Rela)];
+		fseek(fptr, rela_plt.sh_offset, SEEK_SET);
+		fread(rela_plt_buf, rela_plt.sh_size, 1, fptr);
+
+		for (int i = 0; i < rela_plt.sh_size / sizeof(Elf64_Rela); i++)
+		{
+			// find the symbol in the rela.plt section
+			printf("%d\n", sym.st_name);
+			if (ELF64_R_SYM(rela_plt_buf[i].r_info) == sym.st_name)
+			{
+				sym.st_value = rela_plt_buf[i].r_offset;
+				break;
+			}
+		}
+
+		// if not found
+		if (sym.st_value == 0)
+		{
+			*error_val = -1;
+			return 0;
+		}
+
+		// if found return address
+
+		*error_val = 1;
+		return sym.st_value;
 	}
 
 	// if local symbol
 	// printf("%d", ELF64_ST_BIND(sym.st_info));
-	if (ELF64_ST_BIND(sym.st_info) != STB_GLOBAL)
+	if (!found_global)
 	{
 		*error_val = -2;
 		return 0;
@@ -123,96 +190,109 @@ unsigned long find_symbol(const char *symbol_name, char *exe_file_name, int *err
 	return sym.st_value;
 }
 
-// find CALL opcodes and RET opcodes from program running with pid
-void count_calls(unsigned long addr, unsigned long pid)
+// use printf but prepend PRF:: to the output
+void prf_printf(char *format, ...)
 {
-	
-	struct user_regs_struct regs;
+	va_list args;
+	va_start(args, format);
+	printf("PRF:: ");
+	vprintf(format, args);
+	va_end(args);
+}
 
-	// run the program with pid pid
-
-	long call_count = 0;
-	bool in_call = false;
-	int call_ret_diff = 0;
+void count_calls(unsigned long addr, pid_t pid)
+{
 	int wait_status;
-	unsigned long code;
+	wait(&wait_status);
+	// if (WIFSTOPPED(wait_status))
+	// {
+	// 	printf("in line 132 count_calls");
+	// }
 
+	// set breakpoint at addr
+	long func_ep_data;
+	struct user_regs_struct regs;
+	// printf("addr: %lx", addr);
+	func_ep_data = ptrace(PTRACE_PEEKTEXT, pid, (void *)addr, NULL); // read the data at the address
+	// printf("func_ep_data: %lx", func_ep_data);
+	unsigned long break_data = (func_ep_data & 0XFFFFFFFFFFFFFF00) | 0xCC;
+	ptrace(PTRACE_POKETEXT, pid, (void *)addr, (void *)break_data); // put the breakpoint ar the address
 
-	while (1)
+	unsigned long ret_addr = 0;
+	unsigned long ret_addr_data = 0;
+
+	long inner_calls = 0;
+	bool in_func = false;
+	int call_counter = 0;
+	while (WIFSTOPPED(wait_status) && !WIFEXITED(wait_status))
 	{
+		// if (WIFSTOPPED(wait_status))
+		// {
+		// 	printf("WIFSTOPPED\n");
+		// 	// if breakpoint
+		if (WSTOPSIG(wait_status) == SIGTRAP)
+		{
+			// check if breakpoint is at addr
+			ptrace(PTRACE_GETREGS, pid, NULL, &regs); // get the registers
+			// printf("SIGTRAP with %llx\n", regs.rip);
+			if (regs.rip - 1 == addr && !in_func)
+			{
+				in_func = true;
+				inner_calls++;
+				// get return address from stack
+				ret_addr = ptrace(PTRACE_PEEKDATA, pid, (void *)(regs.rsp), NULL);
+				// set breakpoint at return address
+				ret_addr_data = ptrace(PTRACE_PEEKTEXT, pid, (void *)ret_addr, NULL);
+				unsigned long ret_break_data = (ret_addr_data & ~0xff) | 0xcc;
+				ptrace(PTRACE_POKETEXT, pid, (void *)ret_addr, (void *)ret_break_data);
+
+				// continue
+				ptrace(PTRACE_POKETEXT, pid, (void *)addr, (void *)func_ep_data);
+				ptrace(PTRACE_GETREGS, pid, NULL, &regs);
+				regs.rip -= 1;
+				ptrace(PTRACE_SETREGS, pid, NULL, &regs);
+
+				// S
+				// ptrace(PTRACE_SINGLESTEP, pid, NULL, NULL);
+				// ptrace(PTRACE_POKETEXT, pid, (void *)addr, (void *)break_data);
+				// re-add function breakpoint
+			}
+			// if breakpoint is at return address
+			else if (regs.rip - 1 == ret_addr && in_func)
+			{
+				// printf("return address: %lx \n", ret_addr);
+				// remove breakpoint at return address
+				ptrace(PTRACE_POKETEXT, pid, (void *)ret_addr, (void *)ret_addr_data);
+				// re-add function breakpoint
+				ptrace(PTRACE_POKETEXT, pid, (void *)addr, (void *)break_data);
+				ptrace(PTRACE_GETREGS, pid, NULL, &regs);
+				regs.rip -= 1;
+				ptrace(PTRACE_SETREGS, pid, NULL, &regs);
+				// print return value
+				prf_printf("run %ld returned with %lld\n", call_counter, regs.rax);
+				call_counter++;
+				in_func = false;
+				// continue
+			}
+
+			ptrace(PTRACE_CONT, pid, NULL, NULL);
+		}
+		else
+		{
+			// printf("in_else line 202\n");
+			// printf("rip: %lx \n", regs.rip);
+			ptrace(PTRACE_CONT, pid, NULL, NULL);
+		}
 		wait(&wait_status);
-		if (!WIFSTOPPED(wait_status) )
-		{
-			break;
-		}
-
-		ptrace(PTRACE_GETREGS, pid, NULL, &regs);
-		code = ptrace(PTRACE_PEEKTEXT, pid, regs.rip, NULL);
-		// oxc3 for ret
-		// mask the first byte
-		code = code & 0xff;
-
-		// printf("code: %lx \n", code);
-
-
-		if (code == 0xc3 || code == 0xc2) // TODO: add retf?
-		{
-			// printf("IN RET");
-			if (in_call)
-			{
-				call_ret_diff--;
-			}
-
-			if (!call_ret_diff && in_call)
-			{	
-				// Check return value and print
-				unsigned long ret_val = ptrace(PTRACE_PEEKUSER, pid, 8 * RAX, NULL);
-				printf(" run %ld returned with %ld \n ", call_count, ret_val);
-				in_call = false;
-			}
-
-		}
-		//e8 for 'call'
-		else if (code == 0xe8)
-		{
-			if(!in_call)
-			{
-				// check if address matches
-				unsigned long call_addr_offset = ptrace(PTRACE_PEEKTEXT, pid, regs.rip + 1, NULL);
-				// mask
-				call_addr_offset = call_addr_offset & 0xffffffff;
-				printf("call_addr_offset: %lx \n", addr - regs.rip - 5);
-				printf("call_addr_offset: %lx \n", call_addr_offset);
-				unsigned long actual_offset = (addr - regs.rip - 5) & 0xffffffff;
-				if (call_addr_offset == actual_offset)
-				{
-					printf(" run %ld called <function_name>", call_count);
-				
-					in_call = true;
-					call_ret_diff = 1;
-					call_count++;
-				}
-			}
-			else
-			{
-				call_ret_diff++;
-			}
-		}
-		// printf("After call");
-		if (ptrace(PTRACE_SINGLESTEP, pid, NULL, NULL) < 0)
-		{
-			perror("ptrace");
-			break;
-		}
 	}
 }
 
-pid_t run_target(const char *program_name, const char *args)
+pid_t run_target(const char *program_name, char *const args[])
 {
 	pid_t pid = fork();
-	printf("RUNNING program %s with args %s", program_name, args);
 	if (pid > 0)
 	{
+		// printf("RUNNING program %s on new process %d\n", program_name, pid);
 		return pid;
 	}
 
@@ -223,11 +303,14 @@ pid_t run_target(const char *program_name, const char *args)
 			perror("ptrace");
 			return -1;
 		}
-		execl(program_name, program_name , NULL, NULL);
+		// printf("running program %s on new process %d\n", program_name, pid);
+		execl(program_name, program_name, NULL);
+		return 0;
 	}
 	else
 	{
 		perror("fork");
+		// printf("pid < 0 line 237 \n");
 		return -1;
 	}
 }
@@ -238,15 +321,16 @@ int main(int argc, char *const argv[])
 	unsigned long addr = find_symbol(argv[1], argv[2], &err);
 
 	if (err > 0)
-		printf("%s will be loaded to 0x%lx\n", argv[1], addr);
+		// prf_printf("%s will be loaded to 0x%lx\n", argv[1], addr);
+		(void)0;
 	else if (err == -2)
-		printf("%s is not a global symbol! :(\n", argv[1]);
+		prf_printf("%s is not a global symbol! :(\n", argv[1]);
 	else if (err == -1)
-		printf("%s not found!\n", argv[1]);
+		prf_printf("%s not found!\n", argv[1]);
 	else if (err == -3)
-		printf("%s not an executable! :(\n", argv[2]);
+		prf_printf("%s not an executable! :(\n", argv[2]);
 	else if (err == -4)
-		printf("%s is a global symbol, but will come from a shared library\n", argv[1]);
+		prf_printf("%s is a global symbol, but will come from a shared library with address %lx\n", argv[1], addr);
 
 	pid_t pid = run_target(argv[2], argv);
 	if (pid < 0)
@@ -255,6 +339,14 @@ int main(int argc, char *const argv[])
 		perror("fork");
 		return -1;
 	}
-
-	count_calls(addr, pid);
+	if (pid > 0)
+	{
+		count_calls(addr, pid);
+	}
+	else
+	{
+		printf("Error running target program\n");
+		perror("fork");
+		return -1;
+	}
 }
