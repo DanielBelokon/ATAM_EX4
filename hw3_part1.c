@@ -124,18 +124,40 @@ unsigned long find_symbol(const char *symbol_name, char *exe_file_name, int *err
 			}
 		}
 
-		Elf64_Sym dynsym_buf[dynsym.sh_size / sizeof(Elf64_Sym)];
-		fseek(fptr, dynsym.sh_offset, SEEK_SET);
-		fread(dynsym_buf, dynsym.sh_size, 1, fptr);
-
-		for (int i = 0; i < dynsym.sh_size / sizeof(Elf64_Sym); i++)
+		// find dynstr section
+		Elf64_Shdr dynstr;
+		for (int i = 0; i < ehdr.e_shnum; i++)
 		{
-			if (strcmp(strtab_buf + dynsym_buf[i].st_name, symbol_name) == 0)
+			fseek(fptr, ehdr.e_shoff + i * sizeof(Elf64_Shdr), SEEK_SET);
+			fread(&shdr, sizeof(Elf64_Shdr), 1, fptr);
+
+			if (strcmp(shstrtab_buf + shdr.sh_name, ".dynstr") == 0)
 			{
-				sym = dynsym_buf[i];
+				dynstr = shdr;
 				break;
 			}
 		}
+
+		char *dynstr_buf = malloc(dynstr.sh_size);
+		fseek(fptr, dynstr.sh_offset, SEEK_SET);
+		fread(dynstr_buf, dynstr.sh_size, 1, fptr);
+
+		Elf64_Sym dynsym_buf[dynsym.sh_size / sizeof(Elf64_Sym)];
+		fseek(fptr, dynsym.sh_offset, SEEK_SET);
+		fread(dynsym_buf, dynsym.sh_size, 1, fptr);
+		long dynsym_index = 0;
+		for (dynsym_index = 0; dynsym_index < dynsym.sh_size / sizeof(Elf64_Sym); dynsym_index++)
+		{
+			// printf("dynsym name: %s\n", dynstr_buf + dynsym_buf[dynsym_index].st_name);
+			if (strcmp(dynstr_buf + dynsym_buf[dynsym_index].st_name, symbol_name) == 0)
+			{
+				sym = dynsym_buf[dynsym_index];
+				// printf("found in dynsym with index %ld", dynsym_index);
+				break;
+			}
+		}
+
+		// printf("dynsym size: %ld \n", dynsym.sh_size);
 		// find the symbol in the rela.plt section
 		Elf64_Shdr rela_plt;
 		for (int i = 0; i < ehdr.e_shnum; i++)
@@ -150,6 +172,8 @@ unsigned long find_symbol(const char *symbol_name, char *exe_file_name, int *err
 			}
 		}
 
+		// printf("rela.plt size: %ld \n", rela_plt.sh_size);
+
 		Elf64_Rela rela_plt_buf[rela_plt.sh_size / sizeof(Elf64_Rela)];
 		fseek(fptr, rela_plt.sh_offset, SEEK_SET);
 		fread(rela_plt_buf, rela_plt.sh_size, 1, fptr);
@@ -157,13 +181,16 @@ unsigned long find_symbol(const char *symbol_name, char *exe_file_name, int *err
 		for (int i = 0; i < rela_plt.sh_size / sizeof(Elf64_Rela); i++)
 		{
 			// find the symbol in the rela.plt section
-			printf("%d\n", sym.st_name);
-			if (ELF64_R_SYM(rela_plt_buf[i].r_info) == sym.st_name)
+			// printf("%d at index %d, comparing to %ld\n", sym.st_name, dynsym_index, ELF64_R_SYM(rela_plt_buf[i].r_info));
+			if (ELF64_R_SYM(rela_plt_buf[i].r_info) == dynsym_index) ///
 			{
+				// printf("found in rela.plt \n");
 				sym.st_value = rela_plt_buf[i].r_offset;
 				break;
 			}
 		}
+
+		// printf("sym value: %ld \n", sym.st_value);
 
 		// if not found
 		if (sym.st_value == 0)
@@ -174,7 +201,7 @@ unsigned long find_symbol(const char *symbol_name, char *exe_file_name, int *err
 
 		// if found return address
 
-		*error_val = 1;
+		*error_val = 2; // success
 		return sym.st_value;
 	}
 
@@ -190,6 +217,71 @@ unsigned long find_symbol(const char *symbol_name, char *exe_file_name, int *err
 	return sym.st_value;
 }
 
+Elf64_Shdr get_section_header(FILE *fptr, Elf64_Ehdr ehdr, char *section_name)
+{
+	Elf64_Shdr shdr;
+	Elf64_Shdr shstrtab;
+	// read the section header string table
+	for (int i = 0; i < ehdr.e_shnum; i++)
+	{
+		fseek(fptr, ehdr.e_shoff + i * sizeof(Elf64_Shdr), SEEK_SET);
+		fread(&shdr, sizeof(Elf64_Shdr), 1, fptr);
+
+		if (strcmp(section_name, ".shstrtab") == 0)
+		{
+			shstrtab = shdr;
+			break;
+		}
+	}
+
+	char *shstrtab_buf = malloc(shstrtab.sh_size);
+	fseek(fptr, shstrtab.sh_offset, SEEK_SET);
+	fread(shstrtab_buf, shstrtab.sh_size, 1, fptr);
+
+	// read the section header
+	for (int i = 0; i < ehdr.e_shnum; i++)
+	{
+		fseek(fptr, ehdr.e_shoff + i * sizeof(Elf64_Shdr), SEEK_SET);
+		fread(&shdr, sizeof(Elf64_Shdr), 1, fptr);
+
+		if (strcmp(shstrtab_buf + shdr.sh_name, section_name) == 0)
+		{
+			return shdr;
+		}
+	}
+
+	// if not found
+	shdr.sh_name = 0;
+	return shdr;
+}
+
+// Set breakpoint and return original data
+unsigned long add_breakpoint(unsigned long addr, pid_t pid)
+{
+	unsigned long data = ptrace(PTRACE_PEEKTEXT, pid, (void *)addr, NULL);
+	unsigned long break_data = (data & ~0xff) | 0xcc;
+	ptrace(PTRACE_POKETEXT, pid, (void *)addr, (void *)break_data);
+	return data;
+}
+
+// Remove breakpoint and restore original data
+void remove_breakpoint(unsigned long addr, unsigned long data, pid_t pid)
+{
+	ptrace(PTRACE_POKETEXT, pid, (void *)addr, (void *)data);
+}
+
+// continue after breakpoint and return it
+void step_breakpoint(unsigned long addr, unsigned long data, pid_t pid)
+{
+	remove_breakpoint(addr, data, pid);
+	struct user_regs_struct regs;
+	ptrace(PTRACE_GETREGS, pid, NULL, &regs);
+	regs.rip -= 1;
+	ptrace(PTRACE_SETREGS, pid, NULL, &regs);
+	ptrace(PTRACE_SINGLESTEP, pid, NULL, NULL);
+	add_breakpoint(addr, pid);
+}
+
 // use printf but prepend PRF:: to the output
 void prf_printf(char *format, ...)
 {
@@ -200,23 +292,19 @@ void prf_printf(char *format, ...)
 	va_end(args);
 }
 
-void count_calls(unsigned long addr, pid_t pid)
+void count_calls(unsigned long addr, pid_t pid, bool dynamic_addr)
 {
 	int wait_status;
 	wait(&wait_status);
-	// if (WIFSTOPPED(wait_status))
-	// {
-	// 	printf("in line 132 count_calls");
-	// }
+	if (dynamic_addr)
+	{
+		addr = ptrace(PTRACE_PEEKTEXT, pid, (void *)addr, NULL);
+	}
 
 	// set breakpoint at addr
-	long func_ep_data;
+	unsigned long func_ep_data = add_breakpoint(addr, pid);
 	struct user_regs_struct regs;
 	// printf("addr: %lx", addr);
-	func_ep_data = ptrace(PTRACE_PEEKTEXT, pid, (void *)addr, NULL); // read the data at the address
-	// printf("func_ep_data: %lx", func_ep_data);
-	unsigned long break_data = (func_ep_data & 0XFFFFFFFFFFFFFF00) | 0xCC;
-	ptrace(PTRACE_POKETEXT, pid, (void *)addr, (void *)break_data); // put the breakpoint ar the address
 
 	unsigned long ret_addr = 0;
 	unsigned long ret_addr_data = 0;
@@ -224,65 +312,58 @@ void count_calls(unsigned long addr, pid_t pid)
 	long inner_calls = 0;
 	bool in_func = false;
 	int call_counter = 0;
-	while (WIFSTOPPED(wait_status) && !WIFEXITED(wait_status))
+	while (WIFSTOPPED(wait_status))
 	{
-		// if (WIFSTOPPED(wait_status))
-		// {
-		// 	printf("WIFSTOPPED\n");
-		// 	// if breakpoint
-		if (WSTOPSIG(wait_status) == SIGTRAP)
+		if (true)
 		{
+			printf("Looking for addrs: %lx, %lx \n", addr, ret_addr);
 			// check if breakpoint is at addr
 			ptrace(PTRACE_GETREGS, pid, NULL, &regs); // get the registers
-			// printf("SIGTRAP with %llx\n", regs.rip);
-			if (regs.rip - 1 == addr && !in_func)
+			// printf("Current addrs: %lx, in function: %d\n", regs.rip - 1, in_func);
+			if (regs.rip - 1 == addr)
 			{
+				// printf("in function\n");
 				in_func = true;
 				inner_calls++;
 				// get return address from stack
 				ret_addr = ptrace(PTRACE_PEEKDATA, pid, (void *)(regs.rsp), NULL);
 				// set breakpoint at return address
-				ret_addr_data = ptrace(PTRACE_PEEKTEXT, pid, (void *)ret_addr, NULL);
-				unsigned long ret_break_data = (ret_addr_data & ~0xff) | 0xcc;
-				ptrace(PTRACE_POKETEXT, pid, (void *)ret_addr, (void *)ret_break_data);
-
+				ret_addr_data = add_breakpoint(ret_addr, pid);
 				// continue
-				ptrace(PTRACE_POKETEXT, pid, (void *)addr, (void *)func_ep_data);
-				ptrace(PTRACE_GETREGS, pid, NULL, &regs);
-				regs.rip -= 1;
-				ptrace(PTRACE_SETREGS, pid, NULL, &regs);
-
-				// S
-				// ptrace(PTRACE_SINGLESTEP, pid, NULL, NULL);
-				// ptrace(PTRACE_POKETEXT, pid, (void *)addr, (void *)break_data);
-				// re-add function breakpoint
+				step_breakpoint(addr, func_ep_data, pid);
+				// add_breakpoint(addr, pid);
+				// remove_breakpoint(addr, func_ep_data, pid);
 			}
 			// if breakpoint is at return address
-			else if (regs.rip - 1 == ret_addr && in_func)
+			else if (regs.rip - 1 == ret_addr)
 			{
 				// printf("return address: %lx \n", ret_addr);
-				// remove breakpoint at return address
-				ptrace(PTRACE_POKETEXT, pid, (void *)ret_addr, (void *)ret_addr_data);
-				// re-add function breakpoint
-				ptrace(PTRACE_POKETEXT, pid, (void *)addr, (void *)break_data);
-				ptrace(PTRACE_GETREGS, pid, NULL, &regs);
-				regs.rip -= 1;
-				ptrace(PTRACE_SETREGS, pid, NULL, &regs);
-				// print return value
-				prf_printf("run %ld returned with %lld\n", call_counter, regs.rax);
-				call_counter++;
+				inner_calls--;
 				in_func = false;
-				// continue
+				if (inner_calls == 0)
+				{
+					// remove_breakpoint(ret_addr, ret_addr_data, pid);
+					// regs.rip -= 1;
+					// ptrace(PTRACE_SETREGS, pid, NULL, &regs);
+					// add_breakpoint(addr, pid);
+				}
+				else
+				{
+				}
+				// print return value
+				call_counter++;
+				int ret_val = regs.rax;
+				prf_printf("run %ld returned with %d\n", call_counter, ret_val);
+				step_breakpoint(ret_addr, ret_addr_data, pid);
+				// remove_breakpoint(ret_addr, ret_addr_data, pid);
 			}
-
-			ptrace(PTRACE_CONT, pid, NULL, NULL);
 		}
 		else
 		{
 			// printf("in_else line 202\n");
 			// printf("rip: %lx \n", regs.rip);
-			ptrace(PTRACE_CONT, pid, NULL, NULL);
 		}
+		ptrace(PTRACE_CONT, pid, NULL, NULL);
 		wait(&wait_status);
 	}
 }
@@ -304,7 +385,7 @@ pid_t run_target(const char *program_name, char *const args[])
 			return -1;
 		}
 		// printf("running program %s on new process %d\n", program_name, pid);
-		execl(program_name, program_name, NULL);
+		execl(program_name, program_name, args + 2, NULL);
 		return 0;
 	}
 	else
@@ -319,7 +400,7 @@ int main(int argc, char *const argv[])
 {
 	int err = 0;
 	unsigned long addr = find_symbol(argv[1], argv[2], &err);
-
+	// printf("addr: %lx \n", addr);
 	if (err > 0)
 		// prf_printf("%s will be loaded to 0x%lx\n", argv[1], addr);
 		(void)0;
@@ -335,17 +416,17 @@ int main(int argc, char *const argv[])
 	pid_t pid = run_target(argv[2], argv);
 	if (pid < 0)
 	{
-		printf("Error running target program\n");
+		// printf("Error running target program\n");
 		perror("fork");
 		return -1;
 	}
 	if (pid > 0)
 	{
-		count_calls(addr, pid);
+		count_calls(addr, pid, err == 2);
 	}
 	else
 	{
-		printf("Error running target program\n");
+		// printf("Error running target program\n");
 		perror("fork");
 		return -1;
 	}

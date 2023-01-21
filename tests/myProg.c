@@ -1,3 +1,5 @@
+#include <stdio.h>
+#include <string.h>
 // gcc -no-pie -o myProg.out myProg.c /usr/lib/libmySharedLib.so
 int funcWillBeLoadedInRunTime(int, int);
 int funcWillBeLoadedInRunTime2(int, int);

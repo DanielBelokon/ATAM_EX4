@@ -1,1 +1,2 @@
 PRF:: fooNotGlobal is not a global symbol! :(
+Looking for addrs: 0, 0 

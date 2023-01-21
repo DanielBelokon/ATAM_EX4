@@ -1,14 +1,12 @@
-341
-341
-341
-341
-341
-341
-PRF:: funcWillBeLoadedInRunTime2 not found!
-557
-557
-557
-557
-557
-557
-PRF:: funcWillBeLoadedInRunTimeRecursice not found!
+Looking for addrs: 401050, 0 
+Looking for addrs: 401050, 0 
+Looking for addrs: 401050, 4012f2 
+Looking for addrs: 401050, 4012f2 
+PRF:: run 1 returned with -39
+Looking for addrs: 401050, 4012f2 
+Looking for addrs: 401070, 0 
+Looking for addrs: 401070, 0 
+Looking for addrs: 401070, 401304 
+Looking for addrs: 401070, 401304 
+PRF:: run 1 returned with -152
+Looking for addrs: 401070, 401304 
